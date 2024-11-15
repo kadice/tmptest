@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>簽名與拍照功能</title>
+    <style>
+        canvas, img {
+            display: block;
+            margin: 10px auto;
+            border: 1px solid #ccc;
+        }
+
+        #photoPreview {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            border: 2px solid #ccc;
+            width: 150px;
+            height: 100px;
+            object-fit: cover;
+            background-color: #fff;
+        }
+
+        #signatureContainer {
+            position: relative;
+            display: inline-block;
+        }
+
+        #cameraError {
+            color: red;
+            text-align: center;
+            margin-top: 20px;
+            font-size: 18px;
+            display: none;
+        }
+
+        h2 {
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+<h2>簽名與拍照區</h2>
+<div id="signatureContainer">
+    <canvas id="signatureCanvas" width="640" height="480"></canvas>
+    <img id="photoPreview" alt="最新拍攝的照片">
+</div>
+<div id="signatureControls" style="text-align: center;">
+    <button id="clearSignature">清空簽名</button>
+    <button id="replaySignature">重播簽名</button>
+    <button id="completeSignature">完成</button>
+</div>
+
+<div id="cameraError">無法啟動相機，請檢查是否已允許瀏覽器訪問相機。</div>
+
+<script>
+    const signatureCanvas = document.getElementById('signatureCanvas');
+    const signatureCtx = signatureCanvas.getContext('2d');
+    const photoPreview = document.getElementById('photoPreview');
+    const cameraError = document.getElementById('cameraError');
+    let isDrawing = false;
+    let lastX = 0, lastY = 0;
+    let isCapturing = false; // 标志是否正在拍摄
+    const paths = [];
+    let currentPath = [];
+    const capturedPhotos = [];
+    let autoCaptureTimeout;
+    let stopCaptureTimeout;
+
+    const photoCanvas = document.createElement('canvas');
+    photoCanvas.width = 640;
+    photoCanvas.height = 480;
+    const photoCtx = photoCanvas.getContext('2d');
+    const video = document.createElement('video');
+
+    // 簽名邏輯
+    signatureCanvas.addEventListener('mousedown', (e) => {
+        isDrawing = true;
+        lastX = e.offsetX;
+        lastY = e.offsetY;
+        currentPath.push({ type: 'start', x: e.offsetX, y: e.offsetY });
+        startAutoCapture(); // 簽名期間開始拍照
+        if (stopCaptureTimeout) clearTimeout(stopCaptureTimeout); // 清除停止計時
+    });
+
+    signatureCanvas.addEventListener('mousemove', (e) => {
+        if (!isDrawing) return;
+        signatureCtx.beginPath();
+        signatureCtx.moveTo(lastX, lastY);
+        signatureCtx.lineTo(e.offsetX, e.offsetY);
+        signatureCtx.stroke();
+        lastX = e.offsetX;
+        lastY = e.offsetY;
+        currentPath.push({ type: 'draw', x: e.offsetX, y: e.offsetY });
+    });
+
+    signatureCanvas.addEventListener('mouseup', () => {
+        if (isDrawing) {
+            paths.push([...currentPath]);
+            currentPath = [];
+        }
+        isDrawing = false;
+        delayStopAutoCapture(); // 延遲停止拍照
+    });
+
+    signatureCanvas.addEventListener('mouseleave', () => {
+        if (isDrawing) {
+            paths.push([...currentPath]);
+            currentPath = [];
+        }
+        isDrawing = false;
+        delayStopAutoCapture(); // 延遲停止拍照
+    });
+
+    // 清空簽名
+    document.getElementById('clearSignature').addEventListener('click', () => {
+        signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
+        paths.length = 0;
+        capturedPhotos.length = 0; // 清除拍攝的照片
+        photoPreview.src = ''; // 清空照片预览
+        stopAutoCapture(); // 确保拍摄停止
+    });
+
+    // 重播簽名
+    document.getElementById('replaySignature').addEventListener('click', () => {
+        if (paths.length === 0) return; // 如果沒有簽名則不執行
+        signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
+        let i = 0, j = 0;
+
+        function replayStep() {
+            if (i >= paths.length) return;
+            const path = paths[i];
+            if (j < path.length) {
+                const point = path[j];
+                if (point.type === 'start') {
+                    signatureCtx.beginPath();
+                    signatureCtx.moveTo(point.x, point.y);
+                } else if (point.type === 'draw') {
+                    signatureCtx.lineTo(point.x, point.y);
+                    signatureCtx.stroke();
+                }
+                j++;
+                requestAnimationFrame(replayStep);
+            } else {
+                i++;
+                j = 0;
+                replayStep();
+            }
+        }
+
+        replayStep();
+    });
+
+    // 完成提交
+    document.getElementById('completeSignature').addEventListener('click', () => {
+        const data = {
+            paths: paths,
+            photos: capturedPhotos
+        };
+
+        console.log("完成資料:", data);
+
+        // 範例用 AJAX 發送
+        fetch('/submit', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        }).then(response => response.json())
+          .then(result => console.log('提交結果:', result))
+          .catch(error => console.error('提交失敗:', error));
+    });
+
+    // 相機邏輯
+    navigator.mediaDevices.getUserMedia({ video: true })
+        .then(stream => {
+            video.srcObject = stream;
+            video.play();
+        })
+        .catch(err => {
+            console.error('無法訪問相機:', err);
+            cameraError.style.display = 'block';
+        });
+
+    function capturePhoto() {
+        if (!video.srcObject || !isCapturing) {
+            console.warn("相機未啟動或拍攝已停止！");
+            return;
+        }
+        photoCtx.drawImage(video, 0, 0, photoCanvas.width, photoCanvas.height);
+        const photoData = photoCanvas.toDataURL('image/png');
+        capturedPhotos.push(photoData);
+        photoPreview.src = photoData; // 更新右上角預覽
+    }
+
+    function startAutoCapture() {
+        isCapturing = true; // 標記開始拍攝
+        capturePhoto(); // 立即拍一次
+        autoCaptureTimeout = setInterval(() => {
+            capturePhoto();
+        }, 3000); // 每3秒拍一次
+    }
+
+    function delayStopAutoCapture() {
+        if (stopCaptureTimeout) clearTimeout(stopCaptureTimeout);
+        stopCaptureTimeout = setTimeout(() => {
+            stopAutoCapture();
+        }, 5000); // 停止拍攝延遲5秒
+    }
+
+    function stopAutoCapture() {
+        clearInterval(autoCaptureTimeout);
+        autoCaptureTimeout = null;
+        isCapturing = false; // 標記停止拍攝
+        photoPreview.src = ''; // 停止後清空預覽
+    }
+</script>
+
+</body>
+</html>
