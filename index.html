@@ -2,29 +2,36 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>簽名與拍照功能</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>簽名與重播功能</title>
     <style>
-        canvas, img {
+        canvas, video {
             display: block;
             margin: 10px auto;
             border: 1px solid #ccc;
         }
 
-        #photoPreview {
+        #videoStream {
             position: absolute;
             top: 10px;
             right: 10px;
-            border: 2px solid #ccc;
             width: 150px;
             height: 100px;
+            background-color: #000;
             object-fit: cover;
-            background-color: #fff;
         }
 
         #signatureContainer {
             position: relative;
-            display: inline-block;
+            width: 100%;
+            max-width: 640px;
+            margin: 0 auto;
+        }
+
+        #signatureCanvas {
+            width: 100%;
+            height: auto;
+            border: 1px solid #000;
         }
 
         #cameraError {
@@ -38,185 +45,287 @@
         h2 {
             text-align: center;
         }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        #signatureControls {
+            text-align: center;
+            margin-top: 10px;
+        }
+
+        button {
+            margin: 5px;
+            padding: 10px 20px;
+            font-size: 16px;
+        }
     </style>
 </head>
 <body>
 
-<h2>簽名與拍照區</h2>
+<h2>簽名與重播功能</h2>
 <div id="signatureContainer">
-    <canvas id="signatureCanvas" width="640" height="480"></canvas>
-    <img id="photoPreview" alt="最新拍攝的照片">
+    <canvas id="signatureCanvas"></canvas>
 </div>
-<div id="signatureControls" style="text-align: center;">
+<video id="videoStream" autoplay muted playsinline></video>
+<div id="signatureControls">
     <button id="clearSignature">清空簽名</button>
     <button id="replaySignature">重播簽名</button>
-    <button id="completeSignature">完成</button>
+    <button id="confirmSignature">確定</button>
 </div>
 
 <div id="cameraError">無法啟動相機，請檢查是否已允許瀏覽器訪問相機。</div>
 
 <script>
     const signatureCanvas = document.getElementById('signatureCanvas');
-    const signatureCtx = signatureCanvas.getContext('2d');
-    const photoPreview = document.getElementById('photoPreview');
+    const videoStream = document.getElementById('videoStream');
     const cameraError = document.getElementById('cameraError');
+
+    let signatureCtx;
     let isDrawing = false;
+    let isReplaying = false; // 重播狀態
     let lastX = 0, lastY = 0;
-    let isCapturing = false; // 标志是否正在拍摄
-    const paths = [];
-    let currentPath = [];
-    const capturedPhotos = [];
-    let autoCaptureTimeout;
-    let stopCaptureTimeout;
+    let signatureData = []; // 用於記錄簽名軌跡
+    let replayInterval;
 
-    const photoCanvas = document.createElement('canvas');
-    photoCanvas.width = 640;
-    photoCanvas.height = 480;
-    const photoCtx = photoCanvas.getContext('2d');
-    const video = document.createElement('video');
+    const captureCanvas = document.createElement('canvas');
+    const captureCtx = captureCanvas.getContext('2d');
+    let photoInterval;
+    let stopTimeout;
+    let isRecording = false;
+    let capturedImages = []; // 用於存儲拍攝的圖片
 
-    // 簽名邏輯
-    signatureCanvas.addEventListener('mousedown', (e) => {
+    // 初始化簽名板
+    function initCanvas() {
+        const containerWidth = signatureCanvas.parentElement.offsetWidth;
+        signatureCanvas.width = containerWidth;
+        signatureCanvas.height = containerWidth * 0.75; // 假設畫布的高寬比為 4:3
+        signatureCtx = signatureCanvas.getContext('2d');
+        signatureCtx.strokeStyle = "#000";
+        signatureCtx.lineWidth = 2;
+    }
+
+    // 初始化相機
+    async function initCamera() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+            cameraError.textContent = "您的瀏覽器不支援相機功能。";
+            cameraError.style.display = "block";
+            return;
+        }
+
+        try {
+            const constraints = { video: true };
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            videoStream.srcObject = stream;
+
+            // 設置抓取畫布大小與視頻一致
+            const settings = stream.getVideoTracks()[0].getSettings();
+            captureCanvas.width = settings.width || 640;
+            captureCanvas.height = settings.height || 480;
+
+            cameraError.style.display = "none";
+        } catch (err) {
+            console.error("相機啟動失敗:", err);
+            cameraError.textContent = "無法啟動相機，請檢查權限或瀏覽器設置。";
+            cameraError.style.display = "block";
+        }
+    }
+
+    // 簽名相關功能
+    function startDrawing(pos) {
+        if (isReplaying) return; // 若重播中則禁止簽名
         isDrawing = true;
-        lastX = e.offsetX;
-        lastY = e.offsetY;
-        currentPath.push({ type: 'start', x: e.offsetX, y: e.offsetY });
-        startAutoCapture(); // 簽名期間開始拍照
-        if (stopCaptureTimeout) clearTimeout(stopCaptureTimeout); // 清除停止計時
-    });
+        lastX = pos.x;
+        lastY = pos.y;
+        signatureData.push([]); // 開始新的軌跡
 
-    signatureCanvas.addEventListener('mousemove', (e) => {
+        console.log("開始下筆於位置：", pos); // 在每次下筆時 console.log 出來
+
+        if (!isRecording) {
+            isRecording = true;
+            startPhotoCapture(); // 開始拍照
+        }
+    }
+
+    function draw(pos) {
         if (!isDrawing) return;
         signatureCtx.beginPath();
         signatureCtx.moveTo(lastX, lastY);
-        signatureCtx.lineTo(e.offsetX, e.offsetY);
+        signatureCtx.lineTo(pos.x, pos.y);
         signatureCtx.stroke();
-        lastX = e.offsetX;
-        lastY = e.offsetY;
-        currentPath.push({ type: 'draw', x: e.offsetX, y: e.offsetY });
-    });
+        lastX = pos.x;
+        lastY = pos.y;
 
-    signatureCanvas.addEventListener('mouseup', () => {
-        if (isDrawing) {
-            paths.push([...currentPath]);
-            currentPath = [];
+        if (signatureData.length > 0) {
+            signatureData[signatureData.length - 1].push({ x: pos.x, y: pos.y });
         }
+    }
+
+    function stopDrawing() {
+        if (isReplaying) return; // 若重播中則禁止停止簽名
         isDrawing = false;
-        delayStopAutoCapture(); // 延遲停止拍照
-    });
+        resetStopTimeout(); // 開始計時停止拍照
+    }
 
-    signatureCanvas.addEventListener('mouseleave', () => {
-        if (isDrawing) {
-            paths.push([...currentPath]);
-            currentPath = [];
-        }
-        isDrawing = false;
-        delayStopAutoCapture(); // 延遲停止拍照
-    });
+    function resetStopTimeout() {
+        if (stopTimeout) clearTimeout(stopTimeout);
+        stopTimeout = setTimeout(() => {
+            stopPhotoCapture(); // 停止拍照
+        }, 5000); // 5 秒未簽名
+    }
 
-    // 清空簽名
-    document.getElementById('clearSignature').addEventListener('click', () => {
-        signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
-        paths.length = 0;
-        capturedPhotos.length = 0; // 清除拍攝的照片
-        photoPreview.src = ''; // 清空照片预览
-        stopAutoCapture(); // 确保拍摄停止
-    });
-
-    // 重播簽名
-    document.getElementById('replaySignature').addEventListener('click', () => {
-        if (paths.length === 0) return; // 如果沒有簽名則不執行
-        signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
-        let i = 0, j = 0;
-
-        function replayStep() {
-            if (i >= paths.length) return;
-            const path = paths[i];
-            if (j < path.length) {
-                const point = path[j];
-                if (point.type === 'start') {
-                    signatureCtx.beginPath();
-                    signatureCtx.moveTo(point.x, point.y);
-                } else if (point.type === 'draw') {
-                    signatureCtx.lineTo(point.x, point.y);
-                    signatureCtx.stroke();
-                }
-                j++;
-                requestAnimationFrame(replayStep);
-            } else {
-                i++;
-                j = 0;
-                replayStep();
-            }
+    // 重播簽名功能
+    function replaySignature() {
+        if (isReplaying) {
+            stopReplay(); // 若正在重播，停止重播
         }
 
-        replayStep();
-    });
-
-    // 完成提交
-    document.getElementById('completeSignature').addEventListener('click', () => {
-        const data = {
-            paths: paths,
-            photos: capturedPhotos
-        };
-
-        console.log("完成資料:", data);
-
-        // 範例用 AJAX 發送
-        fetch('/submit', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(data)
-        }).then(response => response.json())
-          .then(result => console.log('提交結果:', result))
-          .catch(error => console.error('提交失敗:', error));
-    });
-
-    // 相機邏輯
-    navigator.mediaDevices.getUserMedia({ video: true })
-        .then(stream => {
-            video.srcObject = stream;
-            video.play();
-        })
-        .catch(err => {
-            console.error('無法訪問相機:', err);
-            cameraError.style.display = 'block';
-        });
-
-    function capturePhoto() {
-        if (!video.srcObject || !isCapturing) {
-            console.warn("相機未啟動或拍攝已停止！");
+        if (signatureData.length === 0) {
+            alert("沒有簽名軌跡可供重播！");
             return;
         }
-        photoCtx.drawImage(video, 0, 0, photoCanvas.width, photoCanvas.height);
-        const photoData = photoCanvas.toDataURL('image/png');
-        capturedPhotos.push(photoData);
-        photoPreview.src = photoData; // 更新右上角預覽
+
+        // 僅清空畫布，不清空簽名數據
+        signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
+        isReplaying = true; // 設置重播狀態
+
+        let trackIndex = 0;
+        let pointIndex = 0;
+
+        signatureCtx.strokeStyle = "#000";
+        signatureCtx.lineWidth = 2;
+
+        replayInterval = setInterval(() => {
+            if (trackIndex >= signatureData.length) {
+                stopReplay(); // 重播完成，停止重播
+                return;
+            }
+
+            const track = signatureData[trackIndex];
+
+            if (pointIndex === 0 && track.length > 0) {
+                signatureCtx.beginPath();
+                signatureCtx.moveTo(track[0].x, track[0].y);
+                pointIndex = 1;
+            }
+
+            if (pointIndex < track.length) {
+                signatureCtx.lineTo(track[pointIndex].x, track[pointIndex].y);
+                signatureCtx.stroke();
+                lastX = track[pointIndex].x;
+                lastY = track[pointIndex].y;
+                pointIndex++;
+            } else {
+                // 完成當前軌跡，移至下一個軌跡
+                trackIndex++;
+                pointIndex = 0;
+            }
+
+        }, 30); // 每 30 毫秒畫一個點
     }
 
-    function startAutoCapture() {
-        isCapturing = true; // 標記開始拍攝
-        capturePhoto(); // 立即拍一次
-        autoCaptureTimeout = setInterval(() => {
-            capturePhoto();
-        }, 3000); // 每3秒拍一次
+    function stopReplay() {
+        if (replayInterval) {
+            clearInterval(replayInterval);
+            replayInterval = null;
+        }
+        isReplaying = false; // 清除重播狀態
     }
 
-    function delayStopAutoCapture() {
-        if (stopCaptureTimeout) clearTimeout(stopCaptureTimeout);
-        stopCaptureTimeout = setTimeout(() => {
-            stopAutoCapture();
-        }, 5000); // 停止拍攝延遲5秒
+    // 清空簽名並停止拍照與重播
+    document.getElementById("clearSignature").addEventListener("click", () => {
+        stopPhotoCapture(); // 停止拍照
+        stopReplay();       // 停止重播
+        clearSignature();   // 清空簽名
+        initCanvas();       // 重新初始化簽名板
+    });
+
+    function clearSignature() {
+        signatureCtx.clearRect(0, 0, signatureCanvas.width, signatureCanvas.height);
+        signatureData = []; // 清空簽名數據
+        capturedImages = []; // 清空圖片數據
+        isRecording = false; // 停止記錄狀態
     }
 
-    function stopAutoCapture() {
-        clearInterval(autoCaptureTimeout);
-        autoCaptureTimeout = null;
-        isCapturing = false; // 標記停止拍攝
-        photoPreview.src = ''; // 停止後清空預覽
+    // 拍照相關功能
+    function startPhotoCapture() {
+        if (!photoInterval) {
+            photoInterval = setInterval(() => {
+                captureCtx.drawImage(videoStream, 0, 0, captureCanvas.width, captureCanvas.height);
+                const imageData = captureCanvas.toDataURL('image/png');
+                capturedImages.push(imageData);
+                console.log("拍照記錄！");
+            }, 1000); // 每秒拍照
+        }
     }
+
+    function stopPhotoCapture() {
+        if (photoInterval) {
+            clearInterval(photoInterval); // 停止拍照計時器
+            photoInterval = null;
+        }
+        isRecording = false;
+        console.log("停止拍照");
+    }
+
+    // 確定按鈕功能，將簽名軌跡和圖片顯示在控制台
+    function confirmSignature() {
+        // 準備資料
+        const data = {
+            signatureData: signatureData,
+            images: capturedImages
+        };
+
+        // 在控制台顯示資料
+        console.log('簽名資料已送出：', data);
+        alert('簽名已成功送出！請查看控制台以獲取詳細資訊。');
+
+        // 可選擇在成功提交後清空簽名和圖片
+        clearSignature();
+        stopPhotoCapture();
+        initCanvas();
+    }
+
+    // 簽名畫布事件
+    function getEventPosition(event) {
+        const rect = signatureCanvas.getBoundingClientRect();
+        if (event.touches) {
+            const touch = event.touches[0];
+            return {
+                x: (touch.clientX - rect.left) * (signatureCanvas.width / rect.width),
+                y: (touch.clientY - rect.top) * (signatureCanvas.height / rect.height),
+            };
+        }
+        return {
+            x: (event.offsetX * (signatureCanvas.width / rect.width)),
+            y: (event.offsetY * (signatureCanvas.height / rect.height)),
+        };
+    }
+
+    signatureCanvas.addEventListener('mousedown', (e) => startDrawing(getEventPosition(e)));
+    signatureCanvas.addEventListener('mousemove', (e) => draw(getEventPosition(e)));
+    signatureCanvas.addEventListener('mouseup', stopDrawing);
+    signatureCanvas.addEventListener('mouseleave', stopDrawing); // 防止滑出畫布後仍繪圖
+
+    signatureCanvas.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        startDrawing(getEventPosition(e));
+    });
+    signatureCanvas.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        draw(getEventPosition(e));
+    });
+    signatureCanvas.addEventListener('touchend', stopDrawing);
+    signatureCanvas.addEventListener('touchcancel', stopDrawing); // 處理觸控取消事件
+
+    // 初始化功能
+    initCanvas();
+    initCamera();
+
+    document.getElementById("replaySignature").addEventListener("click", replaySignature);
+    document.getElementById("confirmSignature").addEventListener("click", confirmSignature);
 </script>
 
 </body>
